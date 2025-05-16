@@ -6,11 +6,61 @@ let shapes = [];
 let selectedShapes = [];
 let groups = [];
 
+// Cache system for geometries and materials
+const geometryCache = new Map();
+const materialCache = new Map();
+
+// Adicione após as variáveis globais
+const MAX_HISTORY = 50; // Limite de ações no histórico
+let history = [];
+let currentHistoryIndex = -1;
+
+// Variáveis para o sistema de Undo simplificado
+let lastState = null;
+
+function getCachedGeometry(type, params) {
+    const key = `${type}_${JSON.stringify(params)}`;
+    if (!geometryCache.has(key)) {
+        let geometry;
+        switch (type) {
+            case 'cube':
+                geometry = new THREE.BoxGeometry(params.width, params.height, params.depth);
+                break;
+            case 'sphere':
+                geometry = new THREE.SphereGeometry(params.radius, params.segments, params.segments);
+                break;
+            case 'cylinder':
+                geometry = new THREE.CylinderGeometry(params.radiusTop, params.radiusBottom, params.height, params.radialSegments);
+                break;
+            case 'pyramid':
+                geometry = new THREE.ConeGeometry(params.radius, params.height, params.sides);
+                break;
+            case 'plane':
+                geometry = new THREE.PlaneGeometry(params.width, params.height, params.widthSegments, params.heightSegments);
+                break;
+        }
+        if (geometry) {
+            geometryCache.set(key, geometry);
+        }
+        return geometry;
+    }
+    return geometryCache.get(key).clone();
+}
+
+function getCachedMaterial(color) {
+    if (!materialCache.has(color)) {
+        const material = new THREE.MeshStandardMaterial({ color: color });
+        materialCache.set(color, material);
+    }
+    return materialCache.get(color).clone();
+}
+
 // Initialize the application
 function init() {
     initScene();
     initControls();
     setupEventListeners();
+    initHistory();
     animate();
 }
 
@@ -66,9 +116,22 @@ function initControls() {
     // Create transform controls
     try {
         transformControls = new THREE.TransformControls(camera, renderer.domElement);
+        
+        // Salvar estado ao começar a manipular objetos
+        transformControls.addEventListener('mouseDown', function() {
+            saveLastState();
+        });
+        
+        // Controla o início e fim do arrasto
         transformControls.addEventListener('dragging-changed', function (event) {
             controls.enabled = !event.value;
         });
+        
+        // Quando selecionar um objeto, modificar o transformControls
+        transformControls.addEventListener('objectChange', function() {
+            // Não precisamos fazer nada aqui, o estado já foi salvo no mouseDown
+        });
+        
         scene.add(transformControls);
     } catch (error) {
         console.error('Error initializing TransformControls:', error);
@@ -268,14 +331,31 @@ function addShape() {
     // Make the mesh selectable
     mesh.userData.selectable = true;
     mesh.userData.shapeIndex = shapes.length - 1;
+
+    // Adicionar ao final da função
+    saveState();
 }
 
 // Setup raycaster for object selection
 function setupRaycaster() {
     const raycaster = new THREE.Raycaster();
-    // Configure BVH
     raycaster.firstHitOnly = true;
     const mouse = new THREE.Vector2();
+    
+    // Create BVH for all objects
+    function updateBVH() {
+        shapes.forEach(shape => {
+            if (!shape.mesh.geometry.boundsTree) {
+                shape.mesh.geometry.computeBoundingSphere();
+                shape.mesh.geometry.computeBoundingBox();
+                shape.mesh.geometry.boundsTree = new MeshBVH(shape.mesh.geometry);
+            }
+        });
+    }
+    
+    // Update BVH when objects change
+    const observer = new MutationObserver(updateBVH);
+    observer.observe(document.getElementById('scene-container'), { childList: true });
     
     renderer.domElement.addEventListener('click', (event) => {
         const rect = renderer.domElement.getBoundingClientRect();
@@ -284,19 +364,16 @@ function setupRaycaster() {
         
         raycaster.setFromCamera(mouse, camera);
         
-        // Use accelerated raycasting
         const intersects = [];
         for (const shape of shapes) {
             if (shape.mesh.geometry.boundsTree) {
                 shape.mesh.raycast(raycaster, intersects);
             } else {
-                // Fall back to regular raycasting for objects without BVH
                 const regularIntersects = raycaster.intersectObject(shape.mesh);
                 intersects.push(...regularIntersects);
             }
         }
         
-        // Sort intersections by distance
         intersects.sort((a, b) => a.distance - b.distance);
         
         if (intersects.length > 0) {
@@ -312,6 +389,9 @@ function setupRaycaster() {
 
 // Modify toggleShapeSelection function
 function toggleShapeSelection(object) {
+    // Salvar estado antes de modificar a seleção
+    saveLastState();
+    
     const index = selectedShapes.indexOf(object);
     
     // If selecting a group, deselect individual objects first
@@ -388,19 +468,35 @@ function updateSelectionInfo() {
 window.addEventListener('keydown', function (event) {
     switch (event.key.toLowerCase()) {
         case 'g':
+            saveLastState(); // Salvar antes de mudar para modo translate
             transformControls.setMode('translate');
             break;
         case 'r':
+            saveLastState(); // Salvar antes de mudar para modo rotate
             transformControls.setMode('rotate');
             break;
         case 's':
+            saveLastState(); // Salvar antes de mudar para modo scale
             transformControls.setMode('scale');
             break;
         case 'd':
-            // Duplicate object with Ctrl+D
             if (event.ctrlKey && selectedShapes.length > 0) {
-                event.preventDefault(); // Prevent browser default behavior
+                event.preventDefault();
                 duplicateSelectedObject();
+            }
+            break;
+        case 'z':
+            if (event.ctrlKey) {
+                event.preventDefault();
+                undoLastAction();
+            }
+            break;
+        case 'delete':
+        case 'backspace':
+            if (selectedShapes.length > 0) {
+                event.preventDefault();
+                saveLastState(); // Salvar antes de deletar
+                deleteSelection();
             }
             break;
     }
@@ -443,30 +539,33 @@ function clearSelection() {
 function duplicateSelectedObject() {
     if (selectedShapes.length === 0) return;
     
+    // Salvar o estado antes de duplicar
+    saveLastState();
+    
     const selectedObject = selectedShapes[0];
     let newObject;
     
     if (selectedObject instanceof THREE.Mesh) {
-        // Find the shape info for the selected object
+        // Encontrar as informações da forma para o objeto selecionado
         const shapeInfo = shapes.find(s => s.mesh === selectedObject);
         if (!shapeInfo) return;
         
-        // Create a new geometry of the same type
+        // Criar uma nova geometria do mesmo tipo
         const geometry = selectedObject.geometry.clone();
         const material = selectedObject.material.clone();
         
-        // Create new mesh
+        // Criar novo mesh
         newObject = new THREE.Mesh(geometry, material);
         
-        // Copy position, rotation, and scale
+        // Copiar posição, rotação e escala
         newObject.position.copy(selectedObject.position);
         newObject.rotation.copy(selectedObject.rotation);
         newObject.scale.copy(selectedObject.scale);
         
-        // Offset slightly to make it visible
+        // Deslocar ligeiramente para torná-lo visível
         newObject.position.x += 0.5;
         
-        // Add to scene and shapes array
+        // Adicionar à cena e ao array de formas
         scene.add(newObject);
         shapes.push({
             mesh: newObject,
@@ -474,15 +573,15 @@ function duplicateSelectedObject() {
             color: shapeInfo.color
         });
         
-        // Make the mesh selectable
+        // Tornar o mesh selecionável
         newObject.userData.selectable = true;
         newObject.userData.shapeIndex = shapes.length - 1;
         
-        // Select the new object
+        // Selecionar o novo objeto
         clearSelection();
         toggleShapeSelection(newObject);
     }
-    // Note: Group duplication could be added here in the future
+    // Nota: A duplicação de grupos poderia ser adicionada aqui no futuro
 }
 
 // Update color picker to match selected object's color
@@ -524,6 +623,9 @@ function updateSelectedObjectColor() {
             });
         }
     });
+
+    // Adicionar ao final da função
+    saveState();
 }
 
 // Create a group from selected shapes
@@ -559,27 +661,25 @@ function createGroup() {
     updateSelectionInfo();
     
     alert(`Group created with ${group.children.length} shapes`);
+
+    // Adicionar ao final da função
+    saveState();
 }
 
 // Export the scene or selected group as GLB
 function exportAsGLB() {
-    // Create a temporary scene for export
     const exportScene = new THREE.Scene();
     
-    // Add only the shapes to the export scene
     shapes.forEach(shape => {
         exportScene.add(shape.mesh.clone());
     });
     
-    // Add groups to the export scene
     groups.forEach(group => {
         exportScene.add(group.clone());
     });
 
-    // Create exporter
     const exporter = new THREE.GLTFExporter();
     
-    // Export options
     const options = {
         binary: true,
         animations: [],
@@ -587,13 +687,12 @@ function exportAsGLB() {
         includeCustomExtensions: true
     };
     
-    // Perform export
     exporter.parse(exportScene, function(result) {
         if (result instanceof ArrayBuffer) {
-            saveArrayBuffer(result, 'grupo_3d.glb');
+            saveArrayBuffer(result, '3d_group.glb');
         } else {
             const output = JSON.stringify(result, null, 2);
-            saveString(output, 'grupo_3d.gltf');
+            saveString(output, '3d_group.gltf');
         }
     }, options);
 }
@@ -830,38 +929,33 @@ const ${geometryVar} = new THREE.BufferGeometry();
 let lastGeneratedCode = null;
 
 function showGeneratedCode() {
-    // Determinar os objetos a serem incluídos com base no que está sendo visto ou selecionado
     const objectsToExport = getVisibleOrSelectedObjects();
 
     if (!objectsToExport || objectsToExport.length === 0) {
-        alert('Nenhum objeto visível ou selecionado para gerar o código.');
+        alert('No visible or selected objects to generate code.');
         return;
     }
 
-    // Limpar o código gerado anteriormente, se existir
     if (lastGeneratedCode && document.body.contains(lastGeneratedCode)) {
         document.body.removeChild(lastGeneratedCode);
     }
 
-    // Gerar o novo código
     const code = generateThreeJSCode(objectsToExport);
 
-    // Criar modal para exibir o código
     const modal = document.createElement('div');
     modal.className = 'modal';
     modal.innerHTML = `
         <div class="modal-content">
             <span class="close-button">&times;</span>
-            <h2>Código Three.js Gerado</h2>
+            <h2>Generated Three.js Code</h2>
             <textarea id="generated-code" rows="20" cols="80">${code}</textarea>
-            <button id="copy-code" class="primary-button">Copiar Código</button>
+            <button id="copy-code" class="primary-button">Copy Code</button>
         </div>
     `;
 
     document.body.appendChild(modal);
-    lastGeneratedCode = modal; // Armazenar a referência ao modal atual
+    lastGeneratedCode = modal;
 
-    // Adicionar event listeners
     const closeButton = modal.querySelector('.close-button');
     closeButton.addEventListener('click', () => {
         document.body.removeChild(modal);
@@ -873,10 +967,9 @@ function showGeneratedCode() {
         const textarea = modal.querySelector('#generated-code');
         textarea.select();
         document.execCommand('copy');
-        alert('Código copiado para a área de transferência!');
+        alert('Code copied to clipboard!');
     });
 
-    // Mostrar modal
     modal.style.display = 'block';
 }
 
@@ -972,7 +1065,7 @@ window.addEventListener('load', init);
 // Adicione a função deleteSelection após clearSelection:
 function deleteSelection() {
     if (selectedShapes.length === 0) {
-        alert('Nenhuma forma ou grupo selecionado para deletar.');
+        alert('No shape or group selected to delete.');
         return;
     }
 
@@ -1002,6 +1095,9 @@ function deleteSelection() {
     selectedShapes = [];
     updateSelectionInfo();
     renderer.render(scene, camera);
+
+    // Adicionar ao final da função
+    saveState();
 }
 
 
@@ -1040,4 +1136,202 @@ function updateShapeProperties(mesh) {
             document.getElementById('heightSegments').value = mesh.geometry.parameters.heightSegments;
             break;
     }
+}
+
+// Função para salvar o estado atual da cena
+function saveState() {
+    // Criar uma cópia profunda do estado atual
+    const state = {
+        shapes: shapes.map(shape => ({
+            type: shape.type,
+            color: shape.color,
+            mesh: {
+                position: shape.mesh.position.clone(),
+                rotation: shape.mesh.rotation.clone(),
+                scale: shape.mesh.scale.clone(),
+                geometry: shape.mesh.geometry.clone(),
+                material: shape.mesh.material.clone()
+            }
+        })),
+        groups: groups.map(group => ({
+            children: group.children.map(child => ({
+                position: child.position.clone(),
+                rotation: child.rotation.clone(),
+                scale: child.scale.clone(),
+                geometry: child.geometry ? child.geometry.clone() : null,
+                material: child.material ? child.material.clone() : null
+            }))
+        }))
+    };
+
+    // Remover estados futuros se estivermos no meio do histórico
+    if (currentHistoryIndex < history.length - 1) {
+        history = history.slice(0, currentHistoryIndex + 1);
+    }
+
+    // Adicionar novo estado
+    history.push(state);
+    currentHistoryIndex = history.length - 1;
+
+    // Limitar o tamanho do histórico
+    if (history.length > MAX_HISTORY) {
+        history.shift();
+        currentHistoryIndex--;
+    }
+}
+
+// Função para restaurar um estado
+function restoreState(state) {
+    // Limpar a cena atual
+    shapes.forEach(shape => scene.remove(shape.mesh));
+    groups.forEach(group => scene.remove(group));
+    shapes = [];
+    groups = [];
+
+    // Restaurar shapes
+    state.shapes.forEach(shapeData => {
+        const geometry = shapeData.mesh.geometry;
+        const material = shapeData.mesh.material;
+        const mesh = new THREE.Mesh(geometry, material);
+        
+        mesh.position.copy(shapeData.mesh.position);
+        mesh.rotation.copy(shapeData.mesh.rotation);
+        mesh.scale.copy(shapeData.mesh.scale);
+        
+        scene.add(mesh);
+        shapes.push({
+            mesh: mesh,
+            type: shapeData.type,
+            color: shapeData.color
+        });
+    });
+
+    // Restaurar grupos
+    state.groups.forEach(groupData => {
+        const group = new THREE.Group();
+        groupData.children.forEach(childData => {
+            let child;
+            if (childData.geometry && childData.material) {
+                child = new THREE.Mesh(childData.geometry, childData.material);
+            } else {
+                child = new THREE.Object3D();
+            }
+            child.position.copy(childData.position);
+            child.rotation.copy(childData.rotation);
+            child.scale.copy(childData.scale);
+            group.add(child);
+        });
+        scene.add(group);
+        groups.push(group);
+    });
+
+    // Limpar seleção
+    selectedShapes = [];
+    updateSelectionInfo();
+}
+
+// Funções de Undo/Redo
+function undo() {
+    if (currentHistoryIndex > 0) {
+        currentHistoryIndex--;
+        restoreState(history[currentHistoryIndex]);
+    }
+}
+
+function redo() {
+    if (currentHistoryIndex < history.length - 1) {
+        currentHistoryIndex++;
+        restoreState(history[currentHistoryIndex]);
+    }
+}
+
+// Adicione esta função logo após a inicialização da cena
+function initHistory() {
+    // Salvar o estado inicial vazio
+    saveState();
+}
+
+// Função para salvar apenas o último estado
+function saveLastState() {
+    console.log("Salvando estado"); // Para debug
+    
+    // Criar uma cópia do estado atual
+    const state = {
+        shapes: shapes.map(shape => ({
+            type: shape.type,
+            color: shape.color,
+            mesh: {
+                uuid: shape.mesh.uuid,
+                position: shape.mesh.position.clone(),
+                rotation: shape.mesh.rotation.clone(),
+                scale: shape.mesh.scale.clone()
+            }
+        })),
+        groups: groups.map(group => ({
+            uuid: group.uuid,
+            position: group.position.clone(),
+            rotation: group.rotation.clone(),
+            scale: group.scale.clone(),
+            children: group.children.map(child => ({
+                uuid: child.uuid,
+                position: child.position.clone(),
+                rotation: child.rotation.clone(),
+                scale: child.scale.clone()
+            }))
+        }))
+    };
+
+    lastState = state;
+}
+
+// Função para restaurar o último estado
+function undoLastAction() {
+    if (!lastState) {
+        console.log('Nada para desfazer');
+        return;
+    }
+
+    console.log("Desfazendo última ação"); // Para debug
+    
+    // Restaurar shapes
+    lastState.shapes.forEach(savedShape => {
+        // Encontra o mesh correspondente pelo UUID
+        const shape = shapes.find(s => s.mesh.uuid === savedShape.mesh.uuid);
+        if (shape) {
+            // Restaura posição, rotação e escala
+            shape.mesh.position.copy(savedShape.mesh.position);
+            shape.mesh.rotation.copy(savedShape.mesh.rotation);
+            shape.mesh.scale.copy(savedShape.mesh.scale);
+        }
+    });
+
+    // Restaurar grupos
+    lastState.groups.forEach(savedGroup => {
+        // Encontra o grupo correspondente pelo UUID
+        const group = groups.find(g => g.uuid === savedGroup.uuid);
+        if (group) {
+            // Restaura as propriedades do próprio grupo
+            group.position.copy(savedGroup.position);
+            group.rotation.copy(savedGroup.rotation);
+            group.scale.copy(savedGroup.scale);
+            
+            // Restaura os filhos do grupo
+            savedGroup.children.forEach(savedChild => {
+                // Encontra o filho correspondente pelo UUID
+                const child = group.children.find(c => c.uuid === savedChild.uuid);
+                if (child) {
+                    // Restaura posição, rotação e escala
+                    child.position.copy(savedChild.position);
+                    child.rotation.copy(savedChild.rotation);
+                    child.scale.copy(savedChild.scale);
+                }
+            });
+        }
+    });
+
+    // Resetar o último estado
+    lastState = null;
+    
+    // Atualizar a cena
+    renderer.render(scene, camera);
 }
