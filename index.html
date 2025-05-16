@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="PT-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Editor 3D</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h2>Editor 3D</h2>
+            
+            <div class="control-section">
+                <h3>Seleção da Forma</h3>
+               <select id="shapeType">
+    <option value="cube">Cubo</option>
+    <option value="sphere">Esfera</option>
+    <option value="cylinder">Cilindro</option>
+    <option value="pyramid">Pirâmide</option>
+    <option value="plane">Plane</option>
+</select>
+            </div>
+
+            <div class="control-section" id="dimensionsControls">
+                <!-- Dimensions controls will be dynamically added here -->
+            </div>
+
+            <div class="control-section">
+                <h3>Posição</h3>
+                <div class="control-group">
+                    <label for="posX">X:</label>
+                    <input type="number" id="posX" value="0" step="0.5">
+                </div>
+                <div class="control-group">
+                    <label for="posY">Y:</label>
+                    <input type="number" id="posY" value="0" step="0.5">
+                </div>
+                <div class="control-group">
+                    <label for="posZ">Z:</label>
+                    <input type="number" id="posZ" value="0" step="0.5">
+                </div>
+            </div>
+
+            <div class="control-section">
+                <h3>Rotação (graus)</h3>
+                <div class="control-group">
+                    <label for="rotX">X:</label>
+                    <input type="number" id="rotX" value="0" step="15">
+                </div>
+                <div class="control-group">
+                    <label for="rotY">Y:</label>
+                    <input type="number" id="rotY" value="0" step="15">
+                </div>
+                <div class="control-group">
+                    <label for="rotZ">Z:</label>
+                    <input type="number" id="rotZ" value="0" step="15">
+                </div>
+            </div>
+
+            <div class="control-section">
+                <h3>Cores</h3>
+                <input type="color" id="shapeColor" value="#3498db">
+            </div>
+
+            <div class="control-section">
+                <button id="addShape" class="primary-button">Adicionar Forma</button>
+            </div>
+
+            <div class="control-section">
+                <h3>Grupo</h3>
+                <button id="createGroup" class="secondary-button">Criar Grupo</button>
+                <button id="clearSelection" class="secondary-button">Limpar Seleção</button>
+                <button id="deleteSelection" class="secondary-button">Deletar Seleção</button>
+            </div>
+
+            <div class="control-section">
+                <h3>Exportar</h3>
+                <button id="exportGLB" class="primary-button">Exportar GLB</button>
+                <button id="generateCode" class="primary-button">Gerar Código</button>
+            </div>
+        </div>
+        
+        <div class="viewer">
+            <div id="scene-container"></div>
+            <div id="info-panel">
+                <p>Selecionado: <span id="selection-info"></span></p>
+                <p>Clique nas formas para selecioná-las em grupo</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- After Three.js and OrbitControls, before app.js -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/TransformControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/exporters/GLTFExporter.js"></script>
+    <!-- Add before app.js -->
+    <script src="https://unpkg.com/three-mesh-bvh@0.6.3/build/three-mesh-bvh.umd.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
