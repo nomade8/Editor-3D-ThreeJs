@@ -4,6 +4,8 @@
 let scene, camera, renderer, controls;
 let shapes = [];
 let selectedShapes = [];
+let selectedFaceInfo = null; // Added for face selection
+let currentHighlightMesh = null; // Added for face highlight visualization
 let groups = [];
 
 // Cache system for geometries and materials
@@ -377,12 +379,34 @@ function setupRaycaster() {
         intersects.sort((a, b) => a.distance - b.distance);
         
         if (intersects.length > 0) {
-            const object = intersects[0].object;
-            if (object.parent instanceof THREE.Group) {
+            const intersect = intersects[0];
+            const object = intersect.object;
+
+            // Prioritize face selection
+            if (intersect.faceIndex !== undefined && object instanceof THREE.Mesh) {
+                selectedFaceInfo = { object: object, faceIndex: intersect.faceIndex };
+                console.log('Face selecionada:', selectedFaceInfo);
+
+                // Clear object selection and detach transform controls
+                if (selectedShapes.length > 0) {
+                    selectedShapes.forEach(shape => highlightShape(shape, false));
+                    selectedShapes = [];
+                    transformControls.detach();
+                }
+                // TODO: Add visual highlight for the selected face
+                highlightSelectedFace();
+            } else if (object.parent instanceof THREE.Group) {
                 toggleShapeSelection(object.parent);
+                selectedFaceInfo = null; // Clear face selection if a group is selected
+                clearFaceHighlight();
             } else if (object.userData.selectable) {
                 toggleShapeSelection(object);
+                selectedFaceInfo = null; // Clear face selection if an object is selected
+                clearFaceHighlight();
             }
+        } else {
+            // Clicked outside any object
+            clearSelection(); // Clears both object and face selection
         }
     });
 }
@@ -393,6 +417,10 @@ function toggleShapeSelection(object) {
     saveLastState();
     
     const index = selectedShapes.indexOf(object);
+
+    // When an object is selected, clear face selection
+    selectedFaceInfo = null;
+    clearFaceHighlight(); // Clear any existing face highlight
     
     // If selecting a group, deselect individual objects first
     if (object instanceof THREE.Group) {
@@ -526,12 +554,22 @@ function updateSelectionInfo() {
 
 // Clear all selections
 function clearSelection() {
-    selectedShapes.forEach(mesh => {
-        highlightShape(mesh, false);
+    selectedShapes.forEach(meshOrGroup => {
+        if (meshOrGroup instanceof THREE.Mesh) {
+            highlightShape(meshOrGroup, false);
+        } else if (meshOrGroup instanceof THREE.Group) {
+            meshOrGroup.children.forEach(child => {
+                if (child instanceof THREE.Mesh) {
+                    highlightShape(child, false);
+                }
+            });
+        }
     });
     
     selectedShapes = [];
-    transformControls.detach();  // Add this line
+    selectedFaceInfo = null; // Clear face selection
+    clearFaceHighlight(); // Clear any existing face highlight
+    transformControls.detach();
     updateSelectionInfo();
 }
 
@@ -1056,6 +1094,319 @@ function animate() {
     requestAnimationFrame(animate);
     controls.update();
     renderer.render(scene, camera);
+}
+
+/**
+ * Extrudes a specified face of a THREE.Mesh object.
+ * IMPORTANT: This function currently supports only indexed BufferGeometry.
+ * Modifies the object's geometry by adding new vertices and faces.
+ *
+ * @param {THREE.Mesh} object3D The mesh object whose face is to be extruded.
+ * @param {number} faceIndex The index of the face (triangle) to extrude.
+ * @param {number} distance The distance along the face normal to extrude.
+ * @returns {boolean} True if extrusion was successful, false otherwise (e.g., invalid input, non-indexed geometry).
+ */
+function extrudeFace(object3D, faceIndex, distance) {
+    // 1. Validação Inicial
+    if (!(object3D instanceof THREE.Mesh) || !(object3D.geometry instanceof THREE.BufferGeometry) || typeof faceIndex !== 'number' || faceIndex < 0) {
+        console.error("ExtrudeFace: Invalid input parameters.");
+        return false;
+    }
+
+    const geometry = object3D.geometry;
+    const originalPositions = geometry.attributes.position.array;
+    const originalNormals = geometry.attributes.normal ? geometry.attributes.normal.array : null;
+    const originalIndices = geometry.index ? geometry.index.array : null;
+
+    if (!originalIndices) {
+        console.warn("ExtrudeFace: Only indexed geometries are supported at the moment.");
+        return false;
+    }
+
+    if (faceIndex * 3 >= originalIndices.length) {
+        console.error("ExtrudeFace: faceIndex out of bounds.");
+        return false;
+    }
+
+    // 2. Obter Vértices e Normal da Face Original
+    const iA = originalIndices[faceIndex * 3];
+    const iB = originalIndices[faceIndex * 3 + 1];
+    const iC = originalIndices[faceIndex * 3 + 2];
+
+    const vA = new THREE.Vector3().fromBufferAttribute(geometry.attributes.position, iA);
+    const vB = new THREE.Vector3().fromBufferAttribute(geometry.attributes.position, iB);
+    const vC = new THREE.Vector3().fromBufferAttribute(geometry.attributes.position, iC);
+
+    const faceNormal = new THREE.Vector3();
+    faceNormal.crossVectors(vB.clone().sub(vA), vC.clone().sub(vA)).normalize();
+
+    // 3. Criar Novos Vértices (para a face extrudada)
+    const nvA = vA.clone().addScaledVector(faceNormal, distance);
+    const nvB = vB.clone().addScaledVector(faceNormal, distance);
+    const nvC = vC.clone().addScaledVector(faceNormal, distance);
+
+    // 4. Construir Nova Geometria
+    const numOriginalVertices = originalPositions.length / 3;
+    const niA = numOriginalVertices;
+    const niB = numOriginalVertices + 1;
+    const niC = numOriginalVertices + 2;
+
+    // Novo Array de Posições
+    const newPositions = new Float32Array(originalPositions.length + 3 * 3); // +3 vértices * 3 coords
+    newPositions.set(originalPositions);
+    newPositions.set([nvA.x, nvA.y, nvA.z], niA * 3);
+    newPositions.set([nvB.x, nvB.y, nvB.z], niB * 3);
+    newPositions.set([nvC.x, nvC.y, nvC.z], niC * 3);
+
+    // Novo Array de Normais
+    const newNormals = new Float32Array(newPositions.length);
+    if (originalNormals) {
+        newNormals.set(originalNormals);
+    }
+    // As normais dos novos vértices da face extrudada (topo)
+    newNormals.set([faceNormal.x, faceNormal.y, faceNormal.z], niA * 3);
+    newNormals.set([faceNormal.x, faceNormal.y, faceNormal.z], niB * 3);
+    newNormals.set([faceNormal.x, faceNormal.y, faceNormal.z], niC * 3);
+
+    // Novo Array de Índices
+    // A face original (iA, iB, iC) agora se torna a face superior (niA, niB, niC).
+    // Serão adicionadas 6 novas faces laterais (2 triângulos por lado da face original).
+    const newIndices = new Uint32Array(originalIndices.length + 6 * 3); // +6 faces laterais * 3 índices
+    newIndices.set(originalIndices);
+
+    // Atualize a face original para usar os novos vértices (a face extrudada no topo)
+    newIndices[faceIndex * 3] = niA;
+    newIndices[faceIndex * 3 + 1] = niB;
+    newIndices[faceIndex * 3 + 2] = niC;
+
+    let currentIndex = originalIndices.length;
+    // Lado 1 (vA-vB) -> (iA-iB)
+    newIndices[currentIndex++] = iA; newIndices[currentIndex++] = iB; newIndices[currentIndex++] = niB;
+    newIndices[currentIndex++] = iA; newIndices[currentIndex++] = niB; newIndices[currentIndex++] = niA;
+    // Lado 2 (vB-vC) -> (iB-iC)
+    newIndices[currentIndex++] = iB; newIndices[currentIndex++] = iC; newIndices[currentIndex++] = niC;
+    newIndices[currentIndex++] = iB; newIndices[currentIndex++] = niC; newIndices[currentIndex++] = niB;
+    // Lado 3 (vC-vA) -> (iC-iA)
+    newIndices[currentIndex++] = iC; newIndices[currentIndex++] = iA; newIndices[currentIndex++] = niA;
+    newIndices[currentIndex++] = iC; newIndices[currentIndex++] = niA; newIndices[currentIndex++] = niC;
+
+    // 5. Criar e Atribuir a Nova Geometria
+    const newGeometry = new THREE.BufferGeometry();
+    newGeometry.setAttribute('position', new THREE.BufferAttribute(newPositions, 3));
+    newGeometry.setAttribute('normal', new THREE.BufferAttribute(newNormals, 3)); // Atribuir antes de computeVertexNormals
+    newGeometry.setIndex(new THREE.BufferAttribute(newIndices, 1));
+
+    newGeometry.computeVertexNormals(); // Crucial para recalcular as normais corretamente
+
+    geometry.dispose(); // Liberar a geometria antiga
+    object3D.geometry = newGeometry;
+
+    // 6. Atualizar BVH (se existir)
+    // Assegure-se que MeshBVH está acessível (ex: importado ou via script global)
+    if (typeof MeshBVH !== 'undefined') {
+        delete object3D.geometry.boundsTree; // Remover o antigo boundsTree se existir
+        object3D.geometry.boundsTree = new MeshBVH(object3D.geometry);
+        console.log("ExtrudeFace: BVH updated.");
+    } else {
+        console.warn("ExtrudeFace: MeshBVH not available globally. BVH not updated.");
+    }
+
+    // Limpar seleção de face e highlight, pois a geometria mudou
+    if (selectedFaceInfo && selectedFaceInfo.object === object3D) {
+        selectedFaceInfo = null;
+        clearFaceHighlight();
+    }
+
+    // Atualizar o estado para o histórico de undo/redo
+    saveState();
+    console.log("ExtrudeFace: Face extruded successfully.");
+    return true;
+}
+
+/**
+ * Deletes a specified face from a THREE.Mesh object.
+ * IMPORTANT: This function currently supports only indexed BufferGeometry.
+ * Modifies the object's geometry by removing the specified face's indices.
+ * Orphaned vertices are not removed in this version.
+ *
+ * @param {THREE.Mesh} object3D The mesh object whose face is to be deleted.
+ * @param {number} faceIndex The index of the face (triangle) to delete.
+ * @returns {boolean} True if face deletion was successful, false otherwise (e.g., invalid input, non-indexed geometry).
+ */
+function deleteFace(object3D, faceIndex) {
+    // 1. Validação Inicial
+    if (!(object3D instanceof THREE.Mesh) || !(object3D.geometry instanceof THREE.BufferGeometry) || typeof faceIndex !== 'number' || faceIndex < 0) {
+        alert("DeleteFace: Parâmetros de entrada inválidos.");
+        return false;
+    }
+
+    const geometry = object3D.geometry;
+
+    if (!geometry.index) {
+        console.warn("deleteFace: Suporta apenas geometrias indexadas por enquanto.");
+        alert("DeleteFace: Suporta apenas geometrias indexadas por enquanto.");
+        return false;
+    }
+
+    const originalIndices = geometry.index.array;
+    if (faceIndex * 3 >= originalIndices.length) {
+        console.warn("deleteFace: Índice de face inválido.");
+        alert("deleteFace: Índice de face inválido.");
+        return false;
+    }
+
+    // 2. Construir Novo Array de Índices
+    const newIndices = new Uint32Array(originalIndices.length - 3);
+    let newIdx = 0;
+    const faceStartIndex = faceIndex * 3;
+
+    for (let i = 0; i < originalIndices.length; i++) {
+        if (i < faceStartIndex || i >= faceStartIndex + 3) { // Copia todos os índices exceto os da face a ser removida
+            newIndices[newIdx++] = originalIndices[i];
+        }
+    }
+
+    // 3. Manter Atributos de Vértice (Posição, Normal, UVs etc.)
+    // Para esta versão simplificada, não removeremos vértices órfãos.
+    const newPositions = geometry.attributes.position.array.slice(); // Criar cópia
+    const newNormals = geometry.attributes.normal ? geometry.attributes.normal.array.slice() : null;
+    let newUVs = null;
+    if (geometry.attributes.uv) {
+        newUVs = geometry.attributes.uv.array.slice();
+    }
+
+    // 4. Criar e Atribuir a Nova Geometria
+    const newGeometry = new THREE.BufferGeometry();
+    newGeometry.setAttribute('position', new THREE.BufferAttribute(newPositions, 3));
+    if (newNormals) {
+        newGeometry.setAttribute('normal', new THREE.BufferAttribute(newNormals, 3));
+    }
+    if (newUVs) {
+        newGeometry.setAttribute('uv', new THREE.BufferAttribute(newUVs, 2));
+    }
+    newGeometry.setIndex(new THREE.BufferAttribute(newIndices, 1));
+
+    // Recalcular normais é importante, especialmente se a remoção da face alterar a topologia adjacente.
+    // No entanto, como não estamos remapeando vértices ou alterando a forma dos vértices restantes,
+    // as normais dos vértices existentes podem permanecer válidas.
+    // Se houver problemas de sombreamento, descomente:
+    newGeometry.computeVertexNormals();
+
+    // 5. Atualizar Objeto e BVH
+    geometry.dispose(); // Liberar a geometria antiga
+    object3D.geometry = newGeometry;
+
+    if (typeof MeshBVH !== 'undefined' && object3D.geometry.attributes.position) {
+        try {
+            // Assegure que a geometria tem posições, pois MeshBVH requer
+            if (object3D.geometry.attributes.position.count > 0) {
+                 // Remover o antigo boundsTree antes de criar um novo
+                if (object3D.geometry.boundsTree) {
+                    delete object3D.geometry.boundsTree;
+                }
+                object3D.geometry.boundsTree = new MeshBVH(object3D.geometry, { lazyGeneration: false });
+                console.log("deleteFace: BVH updated.");
+            } else {
+                console.warn("deleteFace: BVH not updated because geometry has no vertices after face deletion.");
+                 if (object3D.geometry.boundsTree) {
+                    delete object3D.geometry.boundsTree;
+                }
+            }
+        } catch (e) {
+            console.error("Falha ao reconstruir BVH para deleteFace:", e);
+            if (object3D.geometry.boundsTree) {
+                delete object3D.geometry.boundsTree;
+            }
+        }
+    } else if (object3D.geometry.boundsTree) {
+        delete object3D.geometry.boundsTree; // Remover se não puder reconstruir
+        console.warn("deleteFace: MeshBVH not available or geometry has no positions. BVH removed.");
+    }
+
+
+    // 6. Limpeza e Histórico
+    // Se a face deletada era a que estava selecionada/highlighted
+    if (selectedFaceInfo && selectedFaceInfo.object === object3D && selectedFaceInfo.faceIndex === faceIndex) {
+        clearFaceHighlight();
+        selectedFaceInfo = null;
+        if (typeof updateFaceEditControlsAvailability === 'function') {
+            updateFaceEditControlsAvailability();
+        }
+    } else if (selectedFaceInfo && selectedFaceInfo.object === object3D && selectedFaceInfo.faceIndex > faceIndex) {
+        // Se uma face posterior no mesmo objeto foi selecionada, seu índice precisa ser ajustado.
+        // No entanto, é mais simples limpar a seleção para evitar complexidade.
+        clearFaceHighlight();
+        selectedFaceInfo = null;
+        if (typeof updateFaceEditControlsAvailability === 'function') {
+            updateFaceEditControlsAvailability();
+        }
+    }
+
+
+    saveState(); // Salvar o estado após a modificação
+    console.log("Face deleted successfully.");
+    return true;
+}
+
+/**
+ * Highlights the currently selected face by creating a temporary overlay mesh.
+ */
+function highlightSelectedFace() {
+    clearFaceHighlight(); // Remove any existing highlight
+
+    if (!selectedFaceInfo || selectedFaceInfo.object == null || selectedFaceInfo.faceIndex == null) {
+        return;
+    }
+
+    const { object, faceIndex } = selectedFaceInfo;
+    const geometry = object.geometry;
+    const positionAttribute = geometry.attributes.position;
+    const indexAttribute = geometry.index;
+
+    const vA = new THREE.Vector3();
+    const vB = new THREE.Vector3();
+    const vC = new THREE.Vector3();
+
+    if (indexAttribute) {
+        vA.fromBufferAttribute(positionAttribute, indexAttribute.getX(faceIndex * 3));
+        vB.fromBufferAttribute(positionAttribute, indexAttribute.getY(faceIndex * 3));
+        vC.fromBufferAttribute(positionAttribute, indexAttribute.getZ(faceIndex * 3));
+    } else {
+        vA.fromBufferAttribute(positionAttribute, faceIndex * 3);
+        vB.fromBufferAttribute(positionAttribute, faceIndex * 3 + 1);
+        vC.fromBufferAttribute(positionAttribute, faceIndex * 3 + 2);
+    }
+
+    const highlightGeom = new THREE.BufferGeometry();
+    highlightGeom.setAttribute('position', new THREE.Float32BufferAttribute([vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, vC.x, vC.y, vC.z], 3));
+
+    const highlightMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffff00,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+        depthTest: false // Render on top
+    });
+
+    currentHighlightMesh = new THREE.Mesh(highlightGeom, highlightMaterial);
+    currentHighlightMesh.name = 'faceHighlight';
+
+    // Apply the transformation of the original object to the highlight mesh
+    currentHighlightMesh.applyMatrix4(object.matrixWorld);
+
+    scene.add(currentHighlightMesh);
+}
+
+/**
+ * Removes any existing face highlight overlay from the scene.
+ */
+function clearFaceHighlight() {
+    if (currentHighlightMesh) {
+        scene.remove(currentHighlightMesh);
+        currentHighlightMesh.geometry.dispose();
+        currentHighlightMesh.material.dispose();
+        currentHighlightMesh = null;
+    }
 }
 
 // Start the application when the page loads
